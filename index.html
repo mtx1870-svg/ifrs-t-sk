@@ -8,7 +8,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- React & ReactDOM -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"Zobcrossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <!-- Babel -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <!-- SheetJS -->
@@ -205,6 +205,7 @@
       const [currentImportedCaseIndex, setCurrentImportedCaseIndex] = useState(-1);
       const [isChangingCase, setIsChangingCase] = useState(false);
       const [caseImportError, setCaseImportError] = useState("");
+      const [isApprovingConsensus, setIsApprovingConsensus] = useState(false);
 
       const [editConsensusModal, setEditConsensusModal] = useState(false);
       const [editMD, setEditMD] = useState("");
@@ -790,7 +791,7 @@
       };
 
       const handleApproveConsensus = async (customValues = null) => {
-        if (!consensus) return;
+        if (!consensus || isApprovingConsensus) return;
         const nextNum = approvedEntries.length + 1;
         const activeCaseNumber = currentCasePrompt?.case_number ?? nextNum;
         const finalMD = customValues ? customValues.md : consensus.topMD.value;
@@ -812,23 +813,46 @@
           owner_id: authUserId || null
         };
 
-        await supabase.from('proposals').insert([consensusRecord]);
+        setIsApprovingConsensus(true);
+        setCaseImportError("");
+        try {
+          // Nejdřív uzavřeme studentské návrhy. Pokud RLS zápis odmítne,
+          // nevznikne v deníku osamocený konsensus, ktorý by se dal schválit znovu.
+          const currentPending = pendingList.filter(p => p.year === year);
+          await Promise.all(currentPending.map(async prop => {
+            const studentAmt = parseCleanAmount(prop.amount);
+            const isAmountMatch = Math.abs(studentAmt - finalAmt) <= 1.0001;
+            const isAccountMatch = prop.debit_account === finalMD && prop.credit_account === finalD;
+            const { data, error } = await supabase.from('proposals').update({
+              status: isAccountMatch && isAmountMatch ? 'consensus_match' : 'archived',
+              case_number: activeCaseNumber
+            }).eq('id', prop.id).select('id');
+            if (error) throw error;
+            if (!Array.isArray(data) || data.length !== 1) {
+              throw new Error("Supabase nepovolil zmenu stavu študentského návrhu. Skontrolujte RLS pravidlo pre UPDATE.");
+            }
+          }));
 
-        const currentPending = pendingList.filter(p => p.year === year);
-        for (const prop of currentPending) {
-          const studentAmt = parseCleanAmount(prop.amount);
-          const isAmountMatch = Math.abs(studentAmt - finalAmt) <= 1.0001;
-          const isAccountMatch = (prop.debit_account === finalMD && prop.credit_account === finalD);
-          const isCorrect = isAccountMatch && isAmountMatch;
+          const hasSameConsensus = approvedEntries.some(entry =>
+            String(entry.student_name || "").startsWith("Konsenzus") &&
+            String(entry.case_number) === String(activeCaseNumber) &&
+            entry.debit_account === finalMD &&
+            entry.credit_account === finalD &&
+            Math.abs(parseCleanAmount(entry.amount) - finalAmt) <= 1.0001
+          );
+          if (!hasSameConsensus) {
+            const { error: consensusError } = await supabase.from('proposals').insert([consensusRecord]);
+            if (consensusError) throw consensusError;
+          }
 
-          await supabase.from('proposals').update({
-            status: isCorrect ? 'consensus_match' : 'archived',
-            case_number: activeCaseNumber
-          }).eq('id', prop.id);
+          setEditConsensusModal(false);
+          await loadSupabaseData();
+        } catch (error) {
+          console.error("Schválenie konsenzu sa nepodarilo:", error);
+          setCaseImportError(`Schválenie konsenzu sa nepodarilo: ${error.message || "neznáma chyba"}`);
+        } finally {
+          setIsApprovingConsensus(false);
         }
-
-        setEditConsensusModal(false);
-        loadSupabaseData();
       };
 
       const buildAccountsLedger = (entries) => {
@@ -2745,16 +2769,18 @@
                       <div className="flex gap-1.5">
                         <button
                           onClick={openConsensusEdit}
-                          className="bg-amber-600 hover:bg-amber-700 text-white font-bold px-2.5 py-1 rounded text-xs shadow transition-all flex items-center gap-1"
+                          disabled={isApprovingConsensus}
+                          className="bg-amber-600 hover:bg-amber-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-bold px-2.5 py-1 rounded text-xs shadow transition-all flex items-center gap-1"
                           title="Umožní vyučujúcemu skontrolovať a upraviť hodnoty pred schválením"
                         >
                           ✏️ Upraviť a schváliť
                         </button>
                         <button
                           onClick={() => handleApproveConsensus(null)}
-                          className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-2.5 py-1 rounded text-xs shadow transition-all"
+                          disabled={isApprovingConsensus}
+                          className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-bold px-2.5 py-1 rounded text-xs shadow transition-all"
                         >
-                          ✓ Priamo schváliť
+                          {isApprovingConsensus ? "⏳ Schvaľujem…" : "✓ Priamo schváliť"}
                         </button>
                       </div>
                     </div>
