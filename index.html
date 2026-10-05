@@ -563,6 +563,9 @@
           description: description.trim() || `Účtovný prípad`,
           timestamp: new Date().toLocaleTimeString(),
           status: 'pending',
+          // Číslo zveřejněného případu sváže i opakované pokusy téhož studenta
+          // s jedním hodnoceným účetním případem.
+          case_number: currentCasePrompt?.case_number ?? null,
           owner_id: authUserId
         };
 
@@ -789,6 +792,7 @@
       const handleApproveConsensus = async (customValues = null) => {
         if (!consensus) return;
         const nextNum = approvedEntries.length + 1;
+        const activeCaseNumber = currentCasePrompt?.case_number ?? nextNum;
         const finalMD = customValues ? customValues.md : consensus.topMD.value;
         const finalD = customValues ? customValues.d : consensus.topD.value;
         const finalAmt = parseCleanAmount(customValues ? customValues.amount : consensus.topAmount.value);
@@ -804,7 +808,7 @@
           description: finalDesc,
           timestamp: new Date().toLocaleTimeString(),
           status: 'approved',
-          case_number: nextNum,
+          case_number: activeCaseNumber,
           owner_id: authUserId || null
         };
 
@@ -818,7 +822,8 @@
           const isCorrect = isAccountMatch && isAmountMatch;
 
           await supabase.from('proposals').update({
-            status: isCorrect ? 'consensus_match' : 'archived'
+            status: isCorrect ? 'consensus_match' : 'archived',
+            case_number: activeCaseNumber
           }).eq('id', prop.id);
         }
 
@@ -1187,7 +1192,8 @@
               pendingCount: 0,
               archivedCount: 0,
               lastActive: rec.timestamp || "",
-              records: []
+              records: [],
+              cases: {}
             };
           }
 
@@ -1208,9 +1214,40 @@
 
           statsMap[name].lastActive = rec.timestamp || statsMap[name].lastActive;
           statsMap[name].records.push(rec);
+
+          // Úspešnosť se počítá za účetní případy, ne za jednotlivé pokusy.
+          // Shoda s konsensem proto znamená 100 % za daný případ, i když mu
+          // predcházel jiný (nesprávný) pokus.
+          const caseNumber = rec.case_number;
+          const descriptionKey = String(rec.description || "").trim().toLocaleLowerCase("sk-SK");
+          const caseKey = caseNumber !== null && caseNumber !== undefined && caseNumber !== ""
+            ? `${rec.year || ""}|${caseNumber}`
+            : `${rec.year || ""}|${descriptionKey || rec.id}`;
+          if (!statsMap[name].cases[caseKey]) {
+            statsMap[name].cases[caseKey] = { completed: false, successful: false };
+          }
+          if (rec.status !== 'pending') {
+            statsMap[name].cases[caseKey].completed = true;
+          }
+          if (rec.status === 'approved' || rec.status === 'consensus_match') {
+            statsMap[name].cases[caseKey].successful = true;
+          }
         });
 
-        return Object.values(statsMap).sort((a, b) => b.totalProposals - a.totalProposals);
+        return Object.values(statsMap)
+          .map(stats => {
+            const completedCases = Object.values(stats.cases).filter(item => item.completed);
+            const successfulCases = completedCases.filter(item => item.successful);
+            return {
+              ...stats,
+              evaluatedCases: completedCases.length,
+              successfulCases: successfulCases.length,
+              successRate: completedCases.length
+                ? Math.round((successfulCases.length / completedCases.length) * 100)
+                : 0
+            };
+          })
+          .sort((a, b) => b.totalProposals - a.totalProposals);
       }, [allRecords]);
 
       const filteredStudentRecords = useMemo(() => {
@@ -2121,7 +2158,9 @@
           "Úspešné spolu": s.approvedCount,
           "Zamietnuté": s.rejectedCount,
           "Archivované / Nesprávne": s.archivedCount,
-          "Úspešnosť (%)": s.totalProposals > 0 ? Math.round((s.approvedCount / s.totalProposals) * 100) + " %" : "0 %",
+          "Vyhodnotené účtovné prípady": s.evaluatedCases,
+          "Správne vyriešené účtovné prípady": s.successfulCases,
+          "Úspešnosť (%)": s.successRate + " %",
           "Čas poslednej aktivity": s.lastActive
         }));
         XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summaryData), "Súhrn_Aktivita");
@@ -3306,7 +3345,7 @@
                         </tr>
                       ) : (
                         studentsStats.map((s, idx) => {
-                          const rate = s.totalProposals > 0 ? Math.round((s.approvedCount / s.totalProposals) * 100) : 0;
+                          const rate = s.successRate;
                           return (
                             <tr key={idx} className="hover:bg-slate-50">
                               <td className="p-2.5 font-bold text-slate-800">{s.name}</td>
