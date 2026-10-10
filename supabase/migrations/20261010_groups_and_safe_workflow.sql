@@ -1,6 +1,7 @@
 begin;
 
 create extension if not exists pgcrypto;
+create schema if not exists private;
 
 create table if not exists public.study_groups (
   code text primary key,
@@ -111,7 +112,7 @@ begin
   end if;
 end $$;
 
-create or replace function public.is_group_teacher(p_group_id text)
+create or replace function private.is_group_teacher(p_group_id text)
 returns boolean
 language sql
 stable
@@ -146,7 +147,7 @@ create policy group_year_state_read on public.group_year_state
 
 drop policy if exists group_cases_teacher_read on public.group_cases;
 create policy group_cases_teacher_read on public.group_cases
-  for select to authenticated using (public.is_group_teacher(group_id));
+  for select to authenticated using (private.is_group_teacher(group_id));
 
 -- Pôvodné permissive pravidlá by mohli obísť izoláciu skupín.
 do $$
@@ -159,20 +160,20 @@ begin
 end $$;
 
 create policy proposals_teacher_select on public.proposals
-  for select to authenticated using (public.is_group_teacher(group_id));
+  for select to authenticated using (private.is_group_teacher(group_id));
 create policy proposals_teacher_insert on public.proposals
-  for insert to authenticated with check (public.is_group_teacher(group_id));
+  for insert to authenticated with check (private.is_group_teacher(group_id));
 create policy proposals_teacher_update on public.proposals
   for update to authenticated
-  using (public.is_group_teacher(group_id))
-  with check (public.is_group_teacher(group_id));
+  using (private.is_group_teacher(group_id))
+  with check (private.is_group_teacher(group_id));
 create policy proposals_teacher_delete on public.proposals
-  for delete to authenticated using (public.is_group_teacher(group_id));
+  for delete to authenticated using (private.is_group_teacher(group_id));
 
 -- Starú bezparametrovú funkciu odstránime, aby sa ňou nedalo obísť filtrovanie skupiny.
 drop function if exists public.get_student_records();
 
-create or replace function public.get_student_records(p_group_id text)
+create or replace function private.get_student_records(p_group_id text)
 returns setof public.proposals
 language sql
 stable
@@ -189,7 +190,7 @@ as $$
     );
 $$;
 
-create or replace function public.submit_student_proposal(
+create or replace function private.submit_student_proposal(
   p_group_id text,
   p_year text,
   p_student_name text,
@@ -240,7 +241,7 @@ begin
 end;
 $$;
 
-create or replace function public.replace_group_cases(
+create or replace function private.replace_group_cases(
   p_group_id text,
   p_year text,
   p_cases jsonb
@@ -251,7 +252,7 @@ security definer
 set search_path = public, auth
 as $$
 begin
-  if not public.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
+  if not private.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
   if p_group_id = 'UAXX' then raise exception 'Archívnu skupinu nemožno meniť.'; end if;
   if jsonb_typeof(p_cases) <> 'array' or jsonb_array_length(p_cases) = 0 then
     raise exception 'Zoznam prípadov je prázdny.';
@@ -264,7 +265,7 @@ begin
 end;
 $$;
 
-create or replace function public.publish_group_case(
+create or replace function private.publish_group_case(
   p_group_id text,
   p_year text,
   p_case_number integer
@@ -276,7 +277,7 @@ set search_path = public, auth
 as $$
 declare v_case public.group_cases%rowtype;
 begin
-  if not public.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
+  if not private.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
   if p_group_id = 'UAXX' then raise exception 'Archívnu skupinu nemožno meniť.'; end if;
 
   insert into public.group_year_state (group_id, year, current_case_number, accepting_answers, updated_by)
@@ -314,7 +315,7 @@ begin
 end;
 $$;
 
-create or replace function public.set_group_accepting_answers(
+create or replace function private.set_group_accepting_answers(
   p_group_id text,
   p_year text,
   p_accepting boolean
@@ -325,7 +326,7 @@ security definer
 set search_path = public, auth
 as $$
 begin
-  if not public.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
+  if not private.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
   if p_group_id = 'UAXX' and p_accepting then raise exception 'Archívna skupina neprijíma odpovede.'; end if;
   insert into public.group_year_state (group_id, year, accepting_answers, updated_by)
   values (p_group_id, p_year, p_accepting, auth.uid())
@@ -336,7 +337,7 @@ begin
 end;
 $$;
 
-create or replace function public.review_student_proposal(p_proposal_id text, p_status text)
+create or replace function private.review_student_proposal(p_proposal_id text, p_status text)
 returns void
 language plpgsql
 security definer
@@ -347,13 +348,13 @@ begin
   if p_status not in ('approved', 'rejected') then raise exception 'Neplatný stav.'; end if;
   select group_id into v_group_id from public.proposals where id = p_proposal_id for update;
   if not found then raise exception 'Návrh neexistuje.'; end if;
-  if not public.is_group_teacher(v_group_id) then raise exception 'Nemáte prístup k tejto skupine.'; end if;
+  if not private.is_group_teacher(v_group_id) then raise exception 'Nemáte prístup k tejto skupine.'; end if;
   update public.proposals set status = p_status where id = p_proposal_id and status = 'pending';
   if not found then raise exception 'Návrh už bol spracovaný.'; end if;
 end;
 $$;
 
-create or replace function public.approve_group_consensus(
+create or replace function private.approve_group_consensus(
   p_group_id text,
   p_year text,
   p_case_number integer,
@@ -370,7 +371,7 @@ set search_path = public, auth
 as $$
 declare v_count integer;
 begin
-  if not public.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
+  if not private.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
   perform 1 from public.group_year_state where group_id = p_group_id and year = p_year for update;
 
   select count(*) into v_count from public.proposals
@@ -410,14 +411,14 @@ begin
 end;
 $$;
 
-create or replace function public.reset_group_year(p_group_id text, p_year text)
+create or replace function private.reset_group_year(p_group_id text, p_year text)
 returns void
 language plpgsql
 security definer
 set search_path = public, auth
 as $$
 begin
-  if not public.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
+  if not private.is_group_teacher(p_group_id) then raise exception 'Nemáte prístup k skupine %.', p_group_id; end if;
   update public.proposals set status = 'archived_task'
   where group_id = p_group_id and year = p_year and status <> 'case_prompt';
   delete from public.proposals
@@ -428,8 +429,90 @@ begin
 end;
 $$;
 
+-- Verejné RPC sú iba SECURITY INVOKER obálky. Privilegovaná logika zostáva
+-- v neexponovanej schéme private a vždy sama overuje auth.uid().
+create or replace function public.get_student_records(p_group_id text)
+returns setof public.proposals
+language sql security invoker
+set search_path = public, private
+as $$ select * from private.get_student_records(p_group_id); $$;
+
+create or replace function public.submit_student_proposal(
+  p_group_id text, p_year text, p_student_name text, p_debit_account text,
+  p_credit_account text, p_amount numeric, p_description text, p_case_number integer
+)
+returns text
+language sql security invoker
+set search_path = public, private
+as $$ select private.submit_student_proposal(
+  p_group_id, p_year, p_student_name, p_debit_account,
+  p_credit_account, p_amount, p_description, p_case_number
+); $$;
+
+create or replace function public.replace_group_cases(p_group_id text, p_year text, p_cases jsonb)
+returns void
+language sql security invoker
+set search_path = public, private
+as $$ select private.replace_group_cases(p_group_id, p_year, p_cases); $$;
+
+create or replace function public.publish_group_case(p_group_id text, p_year text, p_case_number integer)
+returns void
+language sql security invoker
+set search_path = public, private
+as $$ select private.publish_group_case(p_group_id, p_year, p_case_number); $$;
+
+create or replace function public.set_group_accepting_answers(p_group_id text, p_year text, p_accepting boolean)
+returns void
+language sql security invoker
+set search_path = public, private
+as $$ select private.set_group_accepting_answers(p_group_id, p_year, p_accepting); $$;
+
+create or replace function public.review_student_proposal(p_proposal_id text, p_status text)
+returns void
+language sql security invoker
+set search_path = public, private
+as $$ select private.review_student_proposal(p_proposal_id, p_status); $$;
+
+create or replace function public.approve_group_consensus(
+  p_group_id text, p_year text, p_case_number integer, p_debit_account text,
+  p_credit_account text, p_amount numeric, p_description text, p_label text
+)
+returns void
+language sql security invoker
+set search_path = public, private
+as $$ select private.approve_group_consensus(
+  p_group_id, p_year, p_case_number, p_debit_account,
+  p_credit_account, p_amount, p_description, p_label
+); $$;
+
+create or replace function public.reset_group_year(p_group_id text, p_year text)
+returns void
+language sql security invoker
+set search_path = public, private
+as $$ select private.reset_group_year(p_group_id, p_year); $$;
+
+revoke all on function private.is_group_teacher(text) from public;
+revoke all on function private.get_student_records(text) from public;
+revoke all on function private.submit_student_proposal(text,text,text,text,text,numeric,text,integer) from public;
+revoke all on function private.replace_group_cases(text,text,jsonb) from public;
+revoke all on function private.publish_group_case(text,text,integer) from public;
+revoke all on function private.set_group_accepting_answers(text,text,boolean) from public;
+revoke all on function private.review_student_proposal(text,text) from public;
+revoke all on function private.approve_group_consensus(text,text,integer,text,text,numeric,text,text) from public;
+revoke all on function private.reset_group_year(text,text) from public;
+
+grant usage on schema private to authenticated;
+grant execute on function private.is_group_teacher(text) to authenticated;
+grant execute on function private.get_student_records(text) to authenticated;
+grant execute on function private.submit_student_proposal(text,text,text,text,text,numeric,text,integer) to authenticated;
+grant execute on function private.replace_group_cases(text,text,jsonb) to authenticated;
+grant execute on function private.publish_group_case(text,text,integer) to authenticated;
+grant execute on function private.set_group_accepting_answers(text,text,boolean) to authenticated;
+grant execute on function private.review_student_proposal(text,text) to authenticated;
+grant execute on function private.approve_group_consensus(text,text,integer,text,text,numeric,text,text) to authenticated;
+grant execute on function private.reset_group_year(text,text) to authenticated;
+
 revoke all on function public.get_student_records(text) from public;
-revoke all on function public.is_group_teacher(text) from public;
 revoke all on function public.submit_student_proposal(text,text,text,text,text,numeric,text,integer) from public;
 revoke all on function public.replace_group_cases(text,text,jsonb) from public;
 revoke all on function public.publish_group_case(text,text,integer) from public;
@@ -439,7 +522,6 @@ revoke all on function public.approve_group_consensus(text,text,integer,text,tex
 revoke all on function public.reset_group_year(text,text) from public;
 
 grant execute on function public.get_student_records(text) to authenticated;
-grant execute on function public.is_group_teacher(text) to authenticated;
 grant execute on function public.submit_student_proposal(text,text,text,text,text,numeric,text,integer) to authenticated;
 grant execute on function public.replace_group_cases(text,text,jsonb) to authenticated;
 grant execute on function public.publish_group_case(text,text,integer) to authenticated;
