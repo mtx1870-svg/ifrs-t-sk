@@ -29,6 +29,8 @@
     const SUPABASE_ANON_KEY = "sb_publishable_Ub2zV5VKS1u2UC-AsGzmUw_m03Xs1Gi";
     const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
     const YEAR_ORDER = ["20X1", "20X2", "20X3"];
+    const STUDY_GROUPS = ["UA01", "UA02", "UA03", "UA04", "UA05", "AKT01", "UAXX"];
+    const DEFAULT_GROUP = "UA01";
     const ACCOUNT_FILTER_GROUPS = ["Všetky", "Majetok", "Záväzky", "Vlastné imanie", "Náklady", "Výnosy"];
     const ACCOUNT_NAME_ALIASES = {};
 
@@ -196,6 +198,13 @@
       const [isAuthenticating, setIsAuthenticating] = useState(false);
 
       const [year, setYear] = useState("20X1");
+      const [groupId, setGroupId] = useState(() => {
+        const urlGroup = new URLSearchParams(window.location.search).get("group")?.toUpperCase();
+        const storedGroup = localStorage.getItem("ifrs_group")?.toUpperCase();
+        return STUDY_GROUPS.includes(urlGroup) ? urlGroup : (STUDY_GROUPS.includes(storedGroup) ? storedGroup : DEFAULT_GROUP);
+      });
+      const [acceptingAnswers, setAcceptingAnswers] = useState(false);
+      const [isChangingAcceptance, setIsChangingAcceptance] = useState(false);
       const [activeTab, setActiveTab] = useState("accounts");
       const [allRecords, setAllRecords] = useState([]);
       const [hasLoadedData, setHasLoadedData] = useState(false);
@@ -284,14 +293,20 @@
               if (anonymousError) throw anonymousError;
               session = anonymousData.session;
             }
+            if (!session?.user?.id) throw new Error("Supabase nevrátil platnú používateľskú reláciu.");
             applySession(session);
+            if (isMounted) {
+              setDataLoadError("");
+              setAuthReady(true);
+            }
           } catch (error) {
             console.error("Prihlásenie do Supabase zlyhalo:", error);
             if (isMounted) {
+              setAuthUserId("");
+              setIsTeacher(false);
+              setAuthReady(false);
               setDataLoadError("Nepodarilo sa vytvoriť bezpečnú reláciu. Obnovte stránku alebo kontaktujte vyučujúceho.");
             }
-          } finally {
-            if (isMounted) setAuthReady(true);
           }
         };
 
@@ -307,13 +322,22 @@
       }, []);
 
       const loadSupabaseData = async () => {
-        if (!authReady) return;
+        if (!authReady || !groupId) return;
         try {
           const { data, error } = isTeacher
-            ? await supabase.from('proposals').select('*')
-            : await supabase.rpc('get_student_records');
+            ? await supabase.from('proposals').select('*').eq('group_id', groupId)
+            : await supabase.rpc('get_student_records', { p_group_id: groupId });
           if (error) throw error;
           setAllRecords(Array.isArray(data) ? data : []);
+
+          const { data: stateData, error: stateError } = await supabase
+            .from('group_year_state')
+            .select('accepting_answers')
+            .eq('group_id', groupId)
+            .eq('year', year)
+            .maybeSingle();
+          if (stateError) throw stateError;
+          setAcceptingAnswers(Boolean(stateData?.accepting_answers));
           setDataLoadError("");
         } catch (e) {
           console.error("Chyba pri načítaní zo Supabase:", e);
@@ -326,10 +350,35 @@
       useEffect(() => {
         if (!authReady) return undefined;
         setHasLoadedData(false);
+        setAllRecords([]);
+        setAcceptingAnswers(false);
         loadSupabaseData();
-        const refreshTimer = window.setInterval(loadSupabaseData, 4000);
-        return () => window.clearInterval(refreshTimer);
-      }, [authReady, isTeacher]);
+        const channel = supabase
+          .channel(`ifrs-${groupId}-${year}`)
+          .on('postgres_changes', {
+            event: '*', schema: 'public', table: 'proposals', filter: `group_id=eq.${groupId}`
+          }, loadSupabaseData)
+          .on('postgres_changes', {
+            event: '*', schema: 'public', table: 'group_year_state', filter: `group_id=eq.${groupId}`
+          }, loadSupabaseData)
+          .subscribe();
+        const refreshTimer = window.setInterval(loadSupabaseData, 10000);
+        return () => {
+          window.clearInterval(refreshTimer);
+          supabase.removeChannel(channel);
+        };
+      }, [authReady, isTeacher, groupId, year]);
+
+      useEffect(() => {
+        localStorage.setItem("ifrs_group", groupId);
+        const url = new URL(window.location.href);
+        url.searchParams.set("group", groupId);
+        window.history.replaceState({}, "", url);
+      }, [groupId]);
+
+      useEffect(() => {
+        if (authReady && !isTeacher && groupId === "UAXX") setGroupId(DEFAULT_GROUP);
+      }, [authReady, isTeacher, groupId]);
 
       const [studentName, setStudentName] = useState("");
       const [debitAccount, setDebitAccount] = useState("Zásoby - materiál");
@@ -395,18 +444,37 @@
       }, [currentCasePrompt?.description, currentCasePrompt?.amount, year]);
 
       useEffect(() => {
-        try {
-          const stored = JSON.parse(localStorage.getItem(`ifrs_cases_${year}`) || "[]");
-          const validCases = Array.isArray(stored) ? stored.filter(item => item && item.text) : [];
-          setImportedCases(validCases);
+        let cancelled = false;
+        const loadCases = async () => {
+          if (!authReady || !isTeacher) {
+            setImportedCases([]);
+            setCurrentImportedCaseIndex(-1);
+            return;
+          }
+          const { data, error } = await supabase
+            .from('group_cases')
+            .select('order_number, description, amount')
+            .eq('group_id', groupId)
+            .eq('year', year)
+            .order('order_number');
+          if (cancelled) return;
+          if (error) {
+            setCaseImportError(`Zoznam prípadov sa nepodarilo načítať: ${error.message}`);
+            setImportedCases([]);
+            return;
+          }
+          const cases = (data || []).map(item => ({
+            order: Number(item.order_number),
+            text: item.description,
+            amount: parseCleanAmount(item.amount)
+          }));
+          setImportedCases(cases);
           const promptOrder = Number(currentCasePrompt?.case_number);
-          setCurrentImportedCaseIndex(validCases.findIndex(item => Number(item.order) === promptOrder));
-        } catch (error) {
-          console.warn("Uložené účtovné prípady sa nepodarilo načítať:", error);
-          setImportedCases([]);
-          setCurrentImportedCaseIndex(-1);
-        }
-      }, [year, currentCasePrompt?.case_number]);
+          setCurrentImportedCaseIndex(cases.findIndex(item => Number(item.order) === promptOrder));
+        };
+        loadCases();
+        return () => { cancelled = true; };
+      }, [authReady, isTeacher, groupId, year, currentCasePrompt?.case_number]);
 
       const handleLogin = async (e) => {
         e.preventDefault();
@@ -442,12 +510,13 @@
           await supabase.auth.signOut();
           const { data, error } = await supabase.auth.signInAnonymously();
           if (error) throw error;
-          setAuthUserId(data.user?.id || "");
+          if (!data.user?.id) throw new Error("Supabase nevrátil novú anonymnú reláciu.");
+          setAuthUserId(data.user.id);
+          setDataLoadError("");
+          setAuthReady(true);
         } catch (error) {
           console.error("Odhlásenie zlyhalo:", error);
           setDataLoadError("Nepodarilo sa obnoviť študentskú reláciu. Obnovte stránku.");
-        } finally {
-          setAuthReady(true);
         }
       };
 
@@ -455,22 +524,11 @@
         setIsChangingCase(true);
         setCaseImportError("");
         try {
-          const promptRecord = {
-            id: `case_prompt_${year}`,
-            year,
-            student_name: "__CASE_PROMPT__",
-            debit_account: "",
-            credit_account: "",
-            amount: parseCleanAmount(caseItem?.amount) || 0,
-            description: caseItem?.text || "",
-            timestamp: new Date().toISOString(),
-            status: "case_prompt",
-            case_number: caseItem?.order ?? null,
-            owner_id: authUserId || null
-          };
-          const { error } = await supabase
-            .from("proposals")
-            .upsert([promptRecord], { onConflict: "id" });
+          const { error } = await supabase.rpc('publish_group_case', {
+            p_group_id: groupId,
+            p_year: year,
+            p_case_number: caseItem?.order ?? null
+          });
           if (error) throw error;
           setCurrentImportedCaseIndex(index);
           await loadSupabaseData();
@@ -514,8 +572,13 @@
             throw new Error("Poradové čísla v stĺpci A sa nesmú opakovať.");
           }
 
+          const { error: replaceError } = await supabase.rpc('replace_group_cases', {
+            p_group_id: groupId,
+            p_year: year,
+            p_cases: parsedCases
+          });
+          if (replaceError) throw replaceError;
           setImportedCases(parsedCases);
-          localStorage.setItem(`ifrs_cases_${year}`, JSON.stringify(parsedCases));
           await publishCasePrompt(parsedCases[0], 0);
         } catch (error) {
           console.error("Import účtovných prípadov zlyhal:", error);
@@ -552,25 +615,26 @@
           alert("Účty na strane MD a D nemôžu byť rovnaké.");
           return;
         }
+        if (!authUserId) {
+          alert("Študentská relácia nie je aktívna. Obnovte stránku a skúste to znovu.");
+          return;
+        }
+        if (!acceptingAnswers) {
+          alert("Vyučujúci momentálne neprijíma odpovede pre túto skupinu a rok.");
+          return;
+        }
 
         setIsSending(true);
-        const newRecord = {
-          id: String(Date.now() + Math.floor(Math.random() * 1000)),
-          year,
-          student_name: studentName.trim() || "Študent",
-          debit_account: debitAccount,
-          credit_account: creditAccount,
-          amount: parsedAmount,
-          description: description.trim() || `Účtovný prípad`,
-          timestamp: new Date().toLocaleTimeString(),
-          status: 'pending',
-          // Číslo zveřejněného případu sváže i opakované pokusy téhož studenta
-          // s jedním hodnoceným účetním případem.
-          case_number: currentCasePrompt?.case_number ?? null,
-          owner_id: authUserId
-        };
-
-        const { error } = await supabase.from('proposals').insert([newRecord]);
+        const { error } = await supabase.rpc('submit_student_proposal', {
+          p_group_id: groupId,
+          p_year: year,
+          p_student_name: studentName.trim() || "Študent",
+          p_debit_account: debitAccount,
+          p_credit_account: creditAccount,
+          p_amount: parsedAmount,
+          p_description: description.trim() || "Účtovný prípad",
+          p_case_number: currentCasePrompt?.case_number ?? null
+        });
         setIsSending(false);
 
         if (error) {
@@ -585,15 +649,36 @@
       };
 
       const handleApprove = async (proposal) => {
-        const approvedCount = allRecords.filter(r => r.year === proposal.year && r.status === 'approved').length;
-        await supabase.from('proposals').update({
-          status: 'approved',
-          case_number: approvedCount + 1
-        }).eq('id', proposal.id);
+        const { error } = await supabase.rpc('review_student_proposal', {
+          p_proposal_id: proposal.id,
+          p_status: 'approved'
+        });
+        if (error) alert("Schválenie zlyhalo: " + error.message);
+        await loadSupabaseData();
       };
 
       const handleReject = async (id) => {
-        await supabase.from('proposals').update({ status: 'rejected' }).eq('id', id);
+        const { error } = await supabase.rpc('review_student_proposal', {
+          p_proposal_id: id,
+          p_status: 'rejected'
+        });
+        if (error) alert("Zamietnutie zlyhalo: " + error.message);
+        await loadSupabaseData();
+      };
+
+      const handleToggleAcceptingAnswers = async () => {
+        setIsChangingAcceptance(true);
+        const { error } = await supabase.rpc('set_group_accepting_answers', {
+          p_group_id: groupId,
+          p_year: year,
+          p_accepting: !acceptingAnswers
+        });
+        setIsChangingAcceptance(false);
+        if (error) {
+          alert("Zmena prijímania odpovedí zlyhala: " + error.message);
+          return;
+        }
+        await loadSupabaseData();
       };
 
       const handleResetYearData = async () => {
@@ -602,7 +687,10 @@
         );
         if (!confirmReset) return;
 
-        const { error } = await supabase.from('proposals').update({ status: 'archived_task' }).eq('year', year);
+        const { error } = await supabase.rpc('reset_group_year', {
+          p_group_id: groupId,
+          p_year: year
+        });
         if (error) {
           alert("Chyba pri vynulovaní: " + error.message);
         } else {
@@ -613,20 +701,20 @@
 
       const handleDeleteAllStudentsActivity = async () => {
         const confirmation = window.prompt(
-          `Naozaj chcete natrvalo vymazať celú históriu a aktivitu všetkých študentov?\n\nTúto akciu nemožno vrátiť späť. Ak súhlasíte, napíšte do poľa nižšie slovo: VYMAZAŤ`
+          `Naozaj chcete natrvalo vymazať históriu skupiny ${groupId}?\n\nTúto akciu nemožno vrátiť späť. Ak súhlasíte, napíšte do poľa nižšie slovo: VYMAZAŤ`
         );
         if (confirmation !== "VYMAZAŤ") {
           alert("Akcia bola zrušená. Údaje zostali zachované.");
           return;
         }
 
-        const { error } = await supabase.from('proposals').delete().neq('id', '0');
+        const { error } = await supabase.from('proposals').delete().eq('group_id', groupId).neq('status', 'case_prompt');
         if (error) {
           alert("Chyba pri vymazávaní: " + error.message);
         } else {
           loadSupabaseData();
           setSelectedStudentFilter("ALL");
-          alert("Celá história návrhov a aktivity študentov bola úspešne vymazaná.");
+          alert(`História skupiny ${groupId} bola úspešne vymazaná.`);
         }
       };
 
@@ -636,7 +724,7 @@
         );
         if (!confirmDelete) return;
 
-        const { error } = await supabase.from('proposals').delete().eq('student_name', studentNameTarget);
+        const { error } = await supabase.from('proposals').delete().eq('group_id', groupId).eq('student_name', studentNameTarget);
         if (error) {
           alert("Chyba pri vymazávaní studenta: " + error.message);
         } else {
@@ -799,51 +887,22 @@
         const finalAmt = parseCleanAmount(customValues ? customValues.amount : consensus.topAmount.value);
         const finalDesc = customValues ? customValues.desc : consensus.desc;
 
-        const consensusRecord = {
-          id: String(Date.now()),
-          year,
-          student_name: customValues ? `Konsenzus (upravený vyučujúcim)` : `Konsenzus (${consensus.total} študentov)`,
-          debit_account: finalMD,
-          credit_account: finalD,
-          amount: finalAmt,
-          description: finalDesc,
-          timestamp: new Date().toLocaleTimeString(),
-          status: 'approved',
-          case_number: activeCaseNumber,
-          owner_id: authUserId || null
-        };
-
         setIsApprovingConsensus(true);
         setCaseImportError("");
         try {
-          // Nejdřív uzavřeme studentské návrhy. Pokud RLS zápis odmítne,
-          // nevznikne v deníku osamocený konsensus, ktorý by se dal schválit znovu.
-          const currentPending = pendingList.filter(p => p.year === year);
-          await Promise.all(currentPending.map(async prop => {
-            const studentAmt = parseCleanAmount(prop.amount);
-            const isAmountMatch = Math.abs(studentAmt - finalAmt) <= 1.0001;
-            const isAccountMatch = prop.debit_account === finalMD && prop.credit_account === finalD;
-            const { data, error } = await supabase.from('proposals').update({
-              status: isAccountMatch && isAmountMatch ? 'consensus_match' : 'archived',
-              case_number: activeCaseNumber
-            }).eq('id', prop.id).select('id');
-            if (error) throw error;
-            if (!Array.isArray(data) || data.length !== 1) {
-              throw new Error("Supabase nepovolil zmenu stavu študentského návrhu. Skontrolujte RLS pravidlo pre UPDATE.");
-            }
-          }));
-
-          const hasSameConsensus = approvedEntries.some(entry =>
-            String(entry.student_name || "").startsWith("Konsenzus") &&
-            String(entry.case_number) === String(activeCaseNumber) &&
-            entry.debit_account === finalMD &&
-            entry.credit_account === finalD &&
-            Math.abs(parseCleanAmount(entry.amount) - finalAmt) <= 1.0001
-          );
-          if (!hasSameConsensus) {
-            const { error: consensusError } = await supabase.from('proposals').insert([consensusRecord]);
-            if (consensusError) throw consensusError;
-          }
+          const { error } = await supabase.rpc('approve_group_consensus', {
+            p_group_id: groupId,
+            p_year: year,
+            p_case_number: activeCaseNumber,
+            p_debit_account: finalMD,
+            p_credit_account: finalD,
+            p_amount: finalAmt,
+            p_description: finalDesc,
+            p_label: customValues
+              ? 'Konsenzus (upravený vyučujúcim)'
+              : `Konsenzus (${consensus.total} študentov)`
+          });
+          if (error) throw error;
 
           setEditConsensusModal(false);
           await loadSupabaseData();
@@ -1505,7 +1564,7 @@
         });
         XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(journalData.length ? journalData : [{ Správa: "Žiadne zápisy" }]), `Denník_${year}`);
 
-        XLSX.writeFile(wb, `IFRS_Uctovna_Zavierka_${year}.xlsx`);
+        XLSX.writeFile(wb, `IFRS_${groupId}_Uctovna_Zavierka_${year}.xlsx`);
       };
 
       const exportToExcel = async () => {
@@ -1608,7 +1667,7 @@
           const url = URL.createObjectURL(blob);
           const link = document.createElement("a");
           link.href = url;
-          link.download = `IFRS_Uctovna_Zavierka_${year}.xlsx`;
+          link.download = `IFRS_${groupId}_Uctovna_Zavierka_${year}.xlsx`;
           document.body.appendChild(link);
           link.click();
           link.remove();
@@ -2223,7 +2282,7 @@
         });
 
         const todayStr = new Date().toISOString().slice(0, 10);
-        XLSX.writeFile(wb, `Aktivita_Studentov_Hodina_${todayStr}.xlsx`);
+        XLSX.writeFile(wb, `Aktivita_${groupId}_${todayStr}.xlsx`);
       };
 
       const balanceComparisonRows = [
@@ -2360,6 +2419,20 @@
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 bg-slate-100 px-2 py-1 rounded-lg border text-xs font-bold text-slate-600">
+                Skupina:
+                <select
+                  value={groupId}
+                  onChange={event => setGroupId(event.target.value)}
+                  className="bg-white border border-slate-300 rounded-md px-2 py-1 font-black text-indigo-700 outline-none"
+                  aria-label="Študijná skupina"
+                >
+                  {STUDY_GROUPS.filter(code => isTeacher || code !== "UAXX").map(code => (
+                    <option key={code} value={code}>{code === "UAXX" ? "UAXX (archív)" : code}</option>
+                  ))}
+                </select>
+              </label>
+
               <div className="flex items-center bg-slate-100 p-1 rounded-lg border">
                 <span className="text-xs font-bold text-slate-500 px-2 uppercase">Rok:</span>
                 {["20X1", "20X2", "20X3"].map(y => (
@@ -2383,6 +2456,17 @@
               >
                 {!hasLoadedData ? "⏳ Načítavam údaje…" : dataLoadError ? "⚠ Údaje nie sú dostupné" : isExporting ? "⏳ Pripravujem výkazy…" : `📥 Stiahnuť výkazy (${year})`}
               </button>
+
+              {isTeacher && (
+                <button
+                  onClick={handleToggleAcceptingAnswers}
+                  disabled={isChangingAcceptance || groupId === "UAXX"}
+                  className={`${acceptingAnswers ? "bg-rose-600 hover:bg-rose-700" : "bg-blue-600 hover:bg-blue-700"} disabled:bg-slate-300 text-white font-bold text-xs px-3 py-2 rounded-lg shadow transition-colors`}
+                  title={groupId === "UAXX" ? "Archívna skupina neprijíma nové odpovede" : "Databázovo povolí alebo zastaví prijímanie odpovedí"}
+                >
+                  {isChangingAcceptance ? "⏳ Mením…" : acceptingAnswers ? "⏹ Zastaviť odpovede" : "▶ Povoliť odpovede"}
+                </button>
+              )}
 
               {isTeacher && (
                 <button
@@ -2577,7 +2661,7 @@
                   <span className="w-2.5 h-2.5 rounded-full bg-blue-600"></span>
                   <h2 className="font-bold text-slate-800 text-sm">Návrh účtovného zápisu</h2>
                 </div>
-                <span className="text-[11px] font-bold text-slate-400">Rok {year}</span>
+                <span className="text-[11px] font-bold text-slate-400">{groupId} · Rok {year}</span>
               </div>
 
               {showSuccessToast && (
@@ -2585,6 +2669,14 @@
                   ✓ Návrh bol úspešne odoslaný vyučujúcemu na schválenie!
                 </div>
               )}
+
+              <div className={`rounded-lg border px-3 py-2 text-xs font-bold ${
+                acceptingAnswers
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                  : "bg-rose-50 border-rose-200 text-rose-800"
+              }`}>
+                Skupina {groupId}: {acceptingAnswers ? "odpovede sa prijímajú" : "prijímanie odpovedí je zastavené"}
+              </div>
 
               {currentCasePrompt ? (
                 <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs">
@@ -2680,7 +2772,7 @@
 
                 <button
                   type="submit"
-                  disabled={isSending}
+                  disabled={isSending || !acceptingAnswers || groupId === "UAXX"}
                   className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white font-bold py-2.5 rounded-lg transition-colors shadow text-xs uppercase tracking-wider"
                 >
                   {isSending ? "Odosielam..." : "🚀 Odoslať návrh na schválenie"}
@@ -3481,3 +3573,4 @@
   </script>
 </body>
 </html>
+
