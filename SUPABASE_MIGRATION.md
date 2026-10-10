@@ -1,5 +1,15 @@
 # Supabase: skupiny a bezpečný priebeh hodiny
 
+## Stav nasadenia
+
+Migrácie boli úspešne aplikované na produkčný slovenský projekt `ifrs-t-sk`
+10. októbra 2026:
+
+- `20261010183930 groups_and_safe_workflow`
+- `20261010184028 groups_advisor_fixes`
+
+Databáza je pripravená na nasadenie frontendu z pull requestu č. 1.
+
 ## Pred nasadením
 
 1. V Supabase vytvorte databázovú zálohu alebo export tabuľky `public.proposals`.
